@@ -20,6 +20,13 @@
 //   POST   /api/push/notify       {username, password, title, body, excludeEndpoint?}
 //                                          — отправить push-уведомление на все устройства
 //                                            аккаунта, кроме excludeEndpoint (обычно — своё)
+//   POST   /api/subscription/request {username?, name, phone}
+//                                          — заявка клиента на оплату/продление подписки
+//   GET    /api/blacklist/meta             — дата последнего обновления чёрного списка
+//   POST   /api/blacklist/search  {query}  — поиск клиента по загруженным страницам
+//   GET    /admin                          — панель администратора (ключ XCAR_ADMIN_KEY):
+//                                            заявки на подписку + загрузка страниц чёрного списка
+//                                            (см. /api/admin/... в README.md)
 //
 // Формат payload: { cars: [...], history: [...], settings: {...} } — ровно то,
 // что хранит клиент в localStorage. Пароли хранятся только в виде хеша
@@ -28,10 +35,15 @@
 
 const http = require("http");
 const db = require("./db");
+const { renderAdminPage } = require("./admin-page");
 
 const PORT = process.env.PORT || 3000;
 const ALLOWED_ORIGIN = process.env.XCAR_ALLOWED_ORIGIN || "*";
-const MAX_BODY_BYTES = 5 * 1024 * 1024; // 5MB — с запасом для истории и списка машин
+const MAX_BODY_BYTES = 8 * 1024 * 1024; // 8MB — с запасом для истории, списка машин и HTML-страниц чёрного списка
+const ADMIN_KEY = process.env.XCAR_ADMIN_KEY || "idris-admin-2026";
+if (!process.env.XCAR_ADMIN_KEY) {
+  console.warn("⚠️  XCAR_ADMIN_KEY не задан — используется ключ по умолчанию. Задайте свой в переменных окружения на Render (иначе панель /admin не защищена).");
+}
 
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
@@ -115,7 +127,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const url = req.url.split("?")[0];
+  const fullUrl = new URL(req.url, "http://internal");
+  const url = fullUrl.pathname;
+  const query = fullUrl.searchParams;
 
   try {
     if (req.method === "GET" && url === "/health") {
@@ -190,6 +204,76 @@ const server = http.createServer(async (req, res) => {
       if (result.error === "not_found") return sendJson(res, 404, { error: "Аккаунт не найден" });
       if (result.error === "bad_password") return sendJson(res, 401, { error: "Неверный пароль" });
       return sendJson(res, 200, { ok: true });
+    }
+
+    // ---------- Подписка: заявка от клиента + ручное продление Идрисом ----------
+
+    if (req.method === "POST" && url === "/api/subscription/request") {
+      const body = await readJsonBody(req);
+      const name = typeof body.name === "string" ? body.name.trim() : "";
+      const phone = typeof body.phone === "string" ? body.phone.trim() : "";
+      if (!name || !phone) return sendJson(res, 400, { error: "Укажите имя и номер телефона" });
+      const rec = db.addSubscriptionRequest({ username: body.username || "", name, phone, note: body.note || "" });
+      return sendJson(res, 200, { ok: true, id: rec.id });
+    }
+
+    if (req.method === "GET" && url === "/api/admin/subscription/requests") {
+      if (query.get("key") !== ADMIN_KEY) return sendJson(res, 401, { error: "Неверный ключ администратора" });
+      return sendJson(res, 200, { requests: db.listSubscriptionRequests() });
+    }
+
+    if (req.method === "DELETE" && url.startsWith("/api/admin/subscription/requests/")) {
+      if (query.get("key") !== ADMIN_KEY) return sendJson(res, 401, { error: "Неверный ключ администратора" });
+      const id = decodeURIComponent(url.slice("/api/admin/subscription/requests/".length));
+      return sendJson(res, 200, db.deleteSubscriptionRequest(id));
+    }
+
+    if (req.method === "POST" && url === "/api/admin/subscription/extend") {
+      const body = await readJsonBody(req);
+      if (body.key !== ADMIN_KEY) return sendJson(res, 401, { error: "Неверный ключ администратора" });
+      const username = typeof body.username === "string" ? body.username.trim() : "";
+      const days = Number(body.days);
+      if (!username) return sendJson(res, 400, { error: "Укажите логин аккаунта" });
+      if (!days || days <= 0) return sendJson(res, 400, { error: "Укажите количество дней" });
+      const result = db.extendSubscription(username, days);
+      if (result.error === "not_found") return sendJson(res, 404, { error: "Аккаунт с таким логином не найден" });
+      return sendJson(res, 200, result);
+    }
+
+    // ---------- Чёрный список: загрузка страниц Идрисом + поиск клиентами ----------
+
+    if (req.method === "GET" && url === "/api/blacklist/meta") {
+      return sendJson(res, 200, db.getBlacklistMeta());
+    }
+
+    if (req.method === "POST" && url === "/api/blacklist/search") {
+      const body = await readJsonBody(req);
+      const results = db.searchBlacklist(body.query || "");
+      return sendJson(res, 200, { results });
+    }
+
+    if (req.method === "GET" && url === "/api/admin/blacklist/pages") {
+      if (query.get("key") !== ADMIN_KEY) return sendJson(res, 401, { error: "Неверный ключ администратора" });
+      return sendJson(res, 200, { pages: db.listBlacklistPages(), meta: db.getBlacklistMeta() });
+    }
+
+    if (req.method === "POST" && url === "/api/admin/blacklist/upload") {
+      const body = await readJsonBody(req);
+      if (body.key !== ADMIN_KEY) return sendJson(res, 401, { error: "Неверный ключ администратора" });
+      if (!body.html || typeof body.html !== "string") return sendJson(res, 400, { error: "Пустая страница" });
+      const rec = db.addBlacklistPage(body.filename || "страница.html", body.html);
+      return sendJson(res, 200, { ok: true, page: rec });
+    }
+
+    if (req.method === "DELETE" && url.startsWith("/api/admin/blacklist/pages/")) {
+      if (query.get("key") !== ADMIN_KEY) return sendJson(res, 401, { error: "Неверный ключ администратора" });
+      const id = decodeURIComponent(url.slice("/api/admin/blacklist/pages/".length));
+      return sendJson(res, 200, db.deleteBlacklistPage(id));
+    }
+
+    if (req.method === "GET" && url === "/admin") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(renderAdminPage());
     }
 
     if (req.method === "POST" && url === "/api/push/notify") {

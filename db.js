@@ -28,17 +28,21 @@ function ensureDir() {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
+const SUBSCRIPTION_DEFAULT_DAYS = 365;
+
 function loadRaw() {
   ensureDir();
-  if (!fs.existsSync(DB_PATH)) return { accounts: {} };
+  if (!fs.existsSync(DB_PATH)) return { accounts: {}, subscriptionRequests: [], blacklistPages: [] };
   try {
     const raw = fs.readFileSync(DB_PATH, "utf8");
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || !parsed.accounts) return { accounts: {} };
+    if (!parsed || typeof parsed !== "object" || !parsed.accounts) return { accounts: {}, subscriptionRequests: [], blacklistPages: [] };
+    if (!Array.isArray(parsed.subscriptionRequests)) parsed.subscriptionRequests = [];
+    if (!Array.isArray(parsed.blacklistPages)) parsed.blacklistPages = [];
     return parsed;
   } catch (e) {
     console.error("Не удалось прочитать базу данных, начинаю с чистого листа:", e.message);
-    return { accounts: {} };
+    return { accounts: {}, subscriptionRequests: [], blacklistPages: [] };
   }
 }
 
@@ -84,7 +88,14 @@ function accountExists(username) {
 }
 
 function publicView(rec) {
-  return { username: rec.username, email: rec.email || "", phone: rec.phone || "", payload: rec.payload, updatedAt: rec.updatedAt };
+  return {
+    username: rec.username,
+    email: rec.email || "",
+    phone: rec.phone || "",
+    payload: rec.payload,
+    updatedAt: rec.updatedAt,
+    subscriptionUntil: rec.subscriptionUntil || 0,
+  };
 }
 
 function createAccount(username, password, email, phone, payload) {
@@ -101,6 +112,7 @@ function createAccount(username, password, email, phone, payload) {
     updatedAt: now,
     createdAt: now,
     pushSubscriptions: [],
+    subscriptionUntil: now + SUBSCRIPTION_DEFAULT_DAYS * 86400000,
   };
   data.accounts[key] = rec;
   saveRaw(data);
@@ -231,7 +243,133 @@ async function notifyPush(username, password, notification, excludeEndpoint) {
   return { ok: true, targeted: targets.length, sent, failed };
 }
 
+// ---------- Подписка (продление вручную Идрисом после проверки оплаты) ----------
+
+// Продлевает подписку аккаунта на days дней вперёд от текущей даты окончания
+// (если она уже в прошлом — от текущего момента). Используется только из
+// админ-эндпоинта (защищён ADMIN_KEY на уровне server.js).
+function extendSubscription(username, days) {
+  const data = loadRaw();
+  const key = accountKey(username);
+  const existing = data.accounts[key];
+  if (!existing) return { error: "not_found" };
+  const base = Math.max(existing.subscriptionUntil || 0, Date.now());
+  existing.subscriptionUntil = base + (Number(days) || 0) * 86400000;
+  data.accounts[key] = existing;
+  saveRaw(data);
+  return { ok: true, subscriptionUntil: existing.subscriptionUntil };
+}
+
+function genId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+}
+
+// Заявка на оплату/продление подписки — просто складываем в список, Идрис
+// смотрит их в /admin, проверяет оплату по номеру телефона/ФИО и вручную
+// продлевает через extendSubscription.
+function addSubscriptionRequest(entry) {
+  const data = loadRaw();
+  const rec = {
+    id: genId(),
+    username: typeof entry.username === "string" ? entry.username.trim() : "",
+    name: typeof entry.name === "string" ? entry.name.trim().slice(0, 200) : "",
+    phone: typeof entry.phone === "string" ? entry.phone.trim().slice(0, 60) : "",
+    note: typeof entry.note === "string" ? entry.note.trim().slice(0, 500) : "",
+    createdAt: Date.now(),
+  };
+  data.subscriptionRequests.unshift(rec);
+  if (data.subscriptionRequests.length > 500) data.subscriptionRequests.length = 500;
+  saveRaw(data);
+  return rec;
+}
+
+function listSubscriptionRequests() {
+  const data = loadRaw();
+  return data.subscriptionRequests;
+}
+
+function deleteSubscriptionRequest(id) {
+  const data = loadRaw();
+  const before = data.subscriptionRequests.length;
+  data.subscriptionRequests = data.subscriptionRequests.filter((r) => r.id !== id);
+  saveRaw(data);
+  return { ok: true, removed: before !== data.subscriptionRequests.length };
+}
+
+// ---------- Чёрный список (HTML-страницы, которые загружает Идрис) ----------
+
+function stripHtml(html) {
+  return String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, "\n")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/[ \t]+/g, " ")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
+
+function addBlacklistPage(filename, html) {
+  const data = loadRaw();
+  const rec = {
+    id: genId(),
+    filename: typeof filename === "string" && filename.trim() ? filename.trim().slice(0, 200) : "страница.html",
+    html: String(html || ""),
+    uploadedAt: Date.now(),
+  };
+  data.blacklistPages.unshift(rec);
+  if (data.blacklistPages.length > 200) data.blacklistPages.length = 200;
+  saveRaw(data);
+  return { id: rec.id, filename: rec.filename, uploadedAt: rec.uploadedAt };
+}
+
+function listBlacklistPages() {
+  const data = loadRaw();
+  return data.blacklistPages.map((p) => ({ id: p.id, filename: p.filename, uploadedAt: p.uploadedAt, size: p.html.length }));
+}
+
+function deleteBlacklistPage(id) {
+  const data = loadRaw();
+  const before = data.blacklistPages.length;
+  data.blacklistPages = data.blacklistPages.filter((p) => p.id !== id);
+  saveRaw(data);
+  return { ok: true, removed: before !== data.blacklistPages.length };
+}
+
+function getBlacklistMeta() {
+  const data = loadRaw();
+  const lastUpdatedAt = data.blacklistPages.reduce((max, p) => Math.max(max, p.uploadedAt || 0), 0);
+  return { lastUpdatedAt, pagesCount: data.blacklistPages.length };
+}
+
+// Ищет query (имя или телефон клиента) по тексту всех загруженных страниц.
+// Возвращает совпадающие строки с небольшим контекстом (соседние строки),
+// сгруппированные по странице.
+function searchBlacklist(query) {
+  const q = String(query || "").trim().toLowerCase();
+  if (!q || q.length < 2) return [];
+  const data = loadRaw();
+  const results = [];
+  data.blacklistPages.forEach((p) => {
+    const lines = stripHtml(p.html);
+    lines.forEach((line, i) => {
+      if (line.toLowerCase().includes(q)) {
+        const context = lines.slice(Math.max(0, i - 1), i + 2).join(" · ");
+        results.push({ filename: p.filename, uploadedAt: p.uploadedAt, snippet: context.slice(0, 400) });
+      }
+    });
+  });
+  return results.slice(0, 30);
+}
+
 module.exports = {
   getAccount, accountExists, createAccount, verifyLogin, syncAccount, deleteAccount, DB_PATH,
   getVapidPublicKey, getVapidKeys, addPushSubscription, removePushSubscription, notifyPush,
+  extendSubscription, addSubscriptionRequest, listSubscriptionRequests, deleteSubscriptionRequest,
+  addBlacklistPage, listBlacklistPages, deleteBlacklistPage, getBlacklistMeta, searchBlacklist,
+  SUBSCRIPTION_DEFAULT_DAYS,
 };
