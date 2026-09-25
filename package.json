@@ -1,6 +1,8 @@
 {
   "name": "xcar-server",
   "version": "1.0.0",
+  "license": "UNLICENSED",
+  "private": true,
   "description": "XCAR — сервер регистрации (логин/пароль/email/телефон), синхронизации, push-уведомлений, подписки и чёрного списка. Без внешних npm-зависимостей — только встроенные модули Node.js.",
   "main": "server.js",
   "scripts": {
